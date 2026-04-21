@@ -1,0 +1,26 @@
+# Python virtual environments
+venv/
+.venv/
+
+# Compiled bytecode
+__pycache__/
+*.pyc
+
+# Trained model artifacts (large binary files)
+*.pkl
+
+# Datasets (large files – keep out of git)
+*.csv
+*.xlsx
+*.xls
+
+# Node / frontend deps
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# IDE / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
