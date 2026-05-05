@@ -1,0 +1,6 @@
+# Pyrefly configuration
+# Points the type-checker at the project's virtual environment
+# so it can resolve numpy, pandas, fastapi, shap, joblib, etc.
+
+[python]
+interpreter = ".venv/Scripts/python.exe"

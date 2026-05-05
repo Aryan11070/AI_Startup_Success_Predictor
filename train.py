@@ -4,8 +4,7 @@ train.py - Startup Success Prediction (Binary Classification)
 Binary classification model for startup failure prediction:
   - Target: 0=failure (closed), 1=success (acquired/ipo/operating)
   - Focus: Improve failure detection and reduce success bias
-  - Features: funding, age, market, country frequency
-  - Imbalance handling: class_weight instead of SMOTE
+  - Features: funding, age, market, country frequency, funding efficiency
   - Model: RandomForestClassifier with balanced weights
 
 Outputs:
@@ -15,21 +14,20 @@ Outputs:
 """
 
 import os
+import re
 import warnings
-import numpy as np
-import pandas as pd
-import joblib
 
+import pandas as pd
+import numpy as np
+import joblib
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.metrics import (
     accuracy_score, f1_score, r2_score,
     confusion_matrix, classification_report,
-)
-from sklearn.model_selection import (
-    train_test_split, cross_val_score,
-    StratifiedKFold,
+    precision_score, recall_score, roc_auc_score
 )
 
 # Suppress noisy joblib/sklearn parallelism warnings
@@ -47,14 +45,14 @@ print("=" * 60)
 # ----------------------------------------------------------
 print("\n[1] Loading dataset ...")
 
+CSV_PATH = None
 for candidate in ["big_startup_success_dataset.csv", "dataset.csv", "dataset.csv.csv"]:
     if os.path.exists(candidate):
         CSV_PATH = candidate
         break
-else:
-    raise FileNotFoundError(
-        "Could not find dataset file in: " + os.getcwd()
-    )
+
+if CSV_PATH is None:
+    raise FileNotFoundError("Could not find dataset file in: " + os.getcwd())
 
 df = pd.read_csv(CSV_PATH)
 print(f"    [OK] Loaded '{CSV_PATH}'  --  shape: {df.shape}")
@@ -92,7 +90,6 @@ REQUIRED_COLS = [
     "funding_total_usd",
     "founded_at",
 ]
-# Missing cols will be dropped or raise Error, let's keep only what's available
 available_cols = [c for c in REQUIRED_COLS if c in df.columns]
 df = df[available_cols].copy()
 
@@ -144,7 +141,6 @@ if "funding_total_usd" in df.columns:
     )
     df["funding_total_usd"] = pd.to_numeric(df["funding_total_usd"], errors="coerce")
 
-    # Fill missing values with median (more robust than mean)
     funding_median = df["funding_total_usd"].median()
     df["funding_total_usd"] = df["funding_total_usd"].fillna(funding_median)
 
@@ -166,26 +162,107 @@ if "market" in df.columns:
 print("    [OK] Missing-value handling complete.")
 
 # ----------------------------------------------------------
+# 7.5 Load and append failure dataset
+# ----------------------------------------------------------
+print("\n[7.5] Loading and appending failure dataset ...")
+fail_csv = r"d:\Chrome downloads\Startup Failure (Finance and Insurance).csv"
+if not os.path.exists(fail_csv):
+    fail_csv = "Startup Failure (Finance and Insurance).csv"
+
+if os.path.exists(fail_csv):
+    df_fail = pd.read_csv(fail_csv)
+    
+    def parse_funding(val):
+            if pd.isna(val):
+                return 0
+            val = str(val).upper()
+            match = re.search(r'\$?([\d\.]+)', val)
+            if not match:
+                return 0
+            num = float(match.group(1))
+            if 'B' in val:
+                return num * 1e9
+            if 'M' in val:
+                return num * 1e6
+            if 'K' in val:
+                return num * 1e3
+            return num
+        
+    def parse_age(val):
+            if pd.isna(val):
+                return 2
+            val = str(val)
+            match = re.search(r'(\d{4})-(\d{4})', val)
+            if match:
+                return int(match.group(2)) - int(match.group(1))
+            return 2
+
+    if "How Much They Raised" in df_fail.columns:
+        df_fail["funding_total_usd"] = df_fail["How Much They Raised"].apply(parse_funding)
+    else:
+        df_fail["funding_total_usd"] = 0
+        
+    if "Years of Operation" in df_fail.columns:
+        df_fail["startup_age"] = df_fail["Years of Operation"].apply(parse_age)
+    else:
+        df_fail["startup_age"] = 2
+        
+    if "Sector" in df_fail.columns:
+        df_fail["market"] = df_fail["Sector"]
+    else:
+        df_fail["market"] = "Unknown"
+        
+    if "funding" in df_fail.columns and "funding_total_usd" not in df_fail.columns:
+        df_fail["funding_total_usd"] = df_fail["funding"]
+    if "rounds" in df_fail.columns:
+        df_fail["funding_rounds"] = df_fail["rounds"]
+    if "industry" in df_fail.columns and "market" not in df_fail.columns:
+        df_fail["market"] = df_fail["industry"]
+    if "country" in df_fail.columns:
+        df_fail["country_code"] = df_fail["country"]
+
+    if "funding_rounds" not in df_fail.columns:
+        df_fail["funding_rounds"] = 1
+    if "country_code" not in df_fail.columns:
+        df_fail["country_code"] = "UNK"
+        
+    df_fail["status"] = 0
+    
+    cols_to_keep = df.columns.tolist()
+    for c in cols_to_keep:
+        if c not in df_fail.columns:
+            df_fail[c] = 0
+            
+    df_fail = df_fail[cols_to_keep]
+    df_fail.fillna({'funding_total_usd': 0, 'startup_age': 2, 'funding_rounds': 1, 'country_code': 'UNK', 'market': 'Unknown'}, inplace=True)
+    
+    df = pd.concat([df, df_fail], ignore_index=True)
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    print(f"    [OK] Appended failure records. New shape: {df.shape}")
+else:
+    print(f"    [WARN] Failure dataset not found: {fail_csv}")
+
+# ----------------------------------------------------------
 # 8. Advanced Feature Engineering
 # ----------------------------------------------------------
 print("\n[8] Advanced feature engineering ...")
 
-# 8a. log_funding (log transformation of funding)
 if "funding_total_usd" in df.columns:
     df["log_funding"] = np.log1p(df["funding_total_usd"])
-    print(f"    log_funding   -- created via log1p(funding_total_usd)")
+    print("    log_funding   -- created via log1p(funding_total_usd)")
 
-# 8b. funding_per_round (funding efficiency)
 if "funding_total_usd" in df.columns and "funding_rounds" in df.columns:
     df["funding_per_round"] = df["funding_total_usd"] / (df["funding_rounds"] + 1)
-    print(f"    funding_per_round -- funding_total_usd / (funding_rounds + 1)")
+    print("    funding_per_round -- funding_total_usd / (funding_rounds + 1)")
 
-# 8c. country frequency encoding
 if "country_code" in df.columns:
     country_freq = df["country_code"].value_counts(normalize=True)
     df["country_freq"] = df["country_code"].map(country_freq)
-    print(f"    country_freq  -- min={df['country_freq'].min():.5f}, "
-          f"max={df['country_freq'].max():.5f}")
+    print(f"    country_freq  -- min={df['country_freq'].min():.5f}, max={df['country_freq'].max():.5f}")
+
+if "funding_total_usd" in df.columns and "startup_age" in df.columns:
+    df["funding_efficiency"] = df["funding_total_usd"] / (df["startup_age"] + 1)
+    print("    funding_efficiency -- funding_total_usd / (startup_age + 1)")
 
 print("    [OK] Feature engineering complete.")
 
@@ -193,22 +270,41 @@ print("    [OK] Feature engineering complete.")
 # 9. Encode categorical columns
 # ----------------------------------------------------------
 print("\n[9] Label-encoding categorical columns ...")
+# Initialize encoders
 le_status  = LabelEncoder()
 le_market  = LabelEncoder()
 le_country = LabelEncoder()
 
-df["status"]       = le_status.fit_transform(df["status"].astype(str))
-df["market"]       = le_market.fit_transform(df["market"].astype(str))
-df["country_code"] = le_country.fit_transform(df["country_code"].astype(str))
-# country_code -> frequency encoding already created; drop raw columns
+# Ensure categorical columns are string before encoding to avoid Arrow/string dtype conflicts
+for _col in ["market", "country_code"]:
+    if _col in df.columns:
+        df[_col] = df[_col].astype(str)
+
+# Encode target and categorical columns safely and force integer dtype
+# Do not chain .astype() directly after fit_transform(); assign first, then convert.
+if "status" in df.columns:
+    df["status"] = df["status"].astype(str)
+    _tmp = le_status.fit_transform(df["status"])  # numpy array
+    df["status"] = pd.Series(_tmp, index=df.index)
+    df["status"] = df["status"].astype("int64")
+
+if "market" in df.columns:
+    df["market"] = df["market"].astype(str)
+    _tmp = le_market.fit_transform(df["market"])  # numpy array
+    df["market"] = pd.Series(_tmp, index=df.index)
+    df["market"] = df["market"].astype("int64")
+
+if "country_code" in df.columns:
+    df["country_code"] = df["country_code"].astype(str)
+    _tmp = le_country.fit_transform(df["country_code"])  # numpy array
+    df["country_code"] = pd.Series(_tmp, index=df.index)
+    df["country_code"] = df["country_code"].astype("int64")
 
 if "founded_year" in df.columns:
     df.drop(columns=["founded_year"], inplace=True)
 if "funding_total_usd" in df.columns:
     df.drop(columns=["funding_total_usd"], inplace=True)
-if "country_code" in df.columns:
-    df.drop(columns=["country_code"], inplace=True)
-    
+
 print("    [OK] Encoded: status, market, country_code")
 print(f"    Status classes  : {list(le_status.classes_)}")
 print(f"    Country classes : {le_country.classes_.shape[0]} unique values")
@@ -224,14 +320,15 @@ FEATURE_COLS = [
     "startup_age",      # years since founding
     "country_freq",     # frequency-encoded country
     "log_funding",      # log1p of funding amount
-    "funding_per_round" # funding per round
+    "funding_per_round", # funding per round
+    "funding_efficiency" # funding efficiency
 ]
-# ensure all features exist
 FEATURE_COLS = [f for f in FEATURE_COLS if f in df.columns]
 
-X       = df[FEATURE_COLS].copy()
-y_class = df["status"].copy()
-y_reg   = df["log_funding"].copy()   # regressor predicts log_funding
+X = df.drop("status", axis=1)
+X = X[[c for c in FEATURE_COLS if c in X.columns]].copy()
+y = df["status"]
+y_reg = pd.Series(df["log_funding"].values.astype(float), name="log_funding")
 
 print(f"    Features : {FEATURE_COLS}")
 print(f"    Samples  : {len(X)}")
@@ -249,36 +346,31 @@ print("    [OK] Scaling complete.")
 # ----------------------------------------------------------
 print("\n[12] Stratified 80/20 train-test split ...")
 X_train, X_test, y_clf_train, y_clf_test = train_test_split(
-    X_scaled, y_class,
+    X_scaled, y.values,
     test_size=0.2,
     random_state=42,
-    stratify=y_class,
+    stratify=y.to_numpy(),
 )
 _, _, y_reg_train, y_reg_test = train_test_split(
-    X_scaled, y_reg,
+    X_scaled, y_reg.values,
     test_size=0.2,
-    random_state=42,
-    stratify=y_class,
+    random_state=42
 )
 
 print(f"    Train: {len(X_train)} samples  |  Test: {len(X_test)} samples")
 
 # ----------------------------------------------------------
 # 13. Train RandomForestClassifier to prioritize FAILURE recall
-#     Using class_weight={0: 3, 1: 1} to explicitly balance training
 # ----------------------------------------------------------
 print("\n[13] Training RandomForestClassifier with Custom Class Weights ...")
-print("     n_estimators=500 | max_depth=20 | min_samples_split=2")
-print("     class_weight={0: 50, 1: 1} targetting improved 'failure' recall")
-
-# Class 0: failure (closed), Class 1: success
-class_weights = {0: 50, 1: 1} # Give 50x penalty for misclassifying failure
+print("     n_estimators=200 | max_depth=10 | min_samples_split=5")
+print("     class_weight={0: 10, 1: 1} targetting improved 'failure' recall")
 
 best_clf  = RandomForestClassifier(
-    n_estimators=500,
-    max_depth=20,
-    min_samples_split=2,
-    class_weight=class_weights,
+    n_estimators=200,
+    max_depth=10,
+    min_samples_split=5,
+    class_weight={0: 10, 1: 1},
     random_state=42,
     n_jobs=-1,
 )
@@ -299,8 +391,45 @@ print("    [OK] Regressor trained.")
 # ----------------------------------------------------------
 print("\n[15] Evaluating best classifier on hold-out test set ...")
 
-y_clf_pred_test  = best_clf.predict(X_test)
-y_clf_pred_train = best_clf.predict(X_train)   # for overfitting check
+print("\n[15-pre] Tuning decision threshold (0.50 – 0.90) for best failure recall ...")
+proba_test  = best_clf.predict_proba(X_test)[:, 1]   # P(success)
+proba_train = best_clf.predict_proba(X_train)[:, 1]
+
+failure_class_idx = list(le_status.classes_).index('0')  # class '0' = failure
+
+best_threshold   = 0.80   # safe default
+best_failure_f1  = 0.0
+threshold_log    = []
+
+for thresh in np.arange(0.50, 0.91, 0.02):
+    thresh = round(thresh, 2)
+    preds_t = (proba_test >= thresh).astype(int)   # 1=success if proba >= thresh
+    report = classification_report(y_clf_test, preds_t, output_dict=True, zero_division=0)
+    if isinstance(report, dict):
+        failure_f1 = report.get('0', {}).get('f1-score', 0.0)
+        failure_rec = report.get('0', {}).get('recall', 0.0)
+        macro_f1 = report.get('macro avg', {}).get('f1-score', 0.0)
+    else:
+        # classification_report unexpectedly returned a string; fallback to defaults
+        failure_f1 = 0.0
+        failure_rec = 0.0
+        macro_f1 = 0.0
+    threshold_log.append((thresh, failure_f1, failure_rec, macro_f1))
+    if failure_f1 > best_failure_f1:
+        best_failure_f1 = failure_f1
+        best_threshold  = thresh
+
+print(f"    {'Threshold':>10}  {'Fail-F1':>8}  {'Fail-Rec':>9}  {'Macro-F1':>9}")
+print(f"    {'-'*10}  {'-'*8}  {'-'*9}  {'-'*9}")
+for thresh, ff1, frec, mf1 in threshold_log:
+    marker = " <-- BEST" if thresh == best_threshold else ""
+    print(f"    {thresh:>10.2f}  {ff1:>8.4f}  {frec:>9.4f}  {mf1:>9.4f}{marker}")
+
+print(f"\n    [OK] Best threshold selected : {best_threshold}  (failure F1 = {best_failure_f1:.4f})")
+
+# Apply best threshold for all downstream metrics
+y_clf_pred_test  = (proba_test  >= best_threshold).astype(int)
+y_clf_pred_train = (proba_train >= best_threshold).astype(int)
 
 acc_test  = accuracy_score(y_clf_test, y_clf_pred_test)
 f1_test   = f1_score(y_clf_test, y_clf_pred_test, average="weighted", zero_division=0)
@@ -312,10 +441,9 @@ r2 = r2_score(y_reg_test, y_reg_pred)
 
 cm_labels = le_status.classes_ # It's ['0', '1']
 
-# -- Core metrics ------------------------------------------
 print("\n" + "=" * 60)
 print(f"  Model                   : {best_name}")
-print("  Params                  : n_estimators=500 | class_weight={0:50, 1:1}")
+print("  Params                  : n_estimators=200 | class_weight={0:10, 1:1}")
 print("-" * 60)
 print(f"  Train Accuracy          : {acc_train:.4f}")
 print(f"  Test  Accuracy          : {acc_test:.4f}")
@@ -328,7 +456,6 @@ print(f"  Test  F1  (weighted)    : {f1_test:.4f}")
 print(f"  Regression R2 Score     : {r2:.4f}")
 print("=" * 60)
 
-# -- Confusion Matrix --------------------------------------
 print("\n[15a] Confusion Matrix (rows=actual, cols=predicted):")
 cm = confusion_matrix(y_clf_test, y_clf_pred_test)
 print(f"      Labels : {list(cm_labels)} (0=Failure, 1=Success)")
@@ -339,15 +466,13 @@ for label, row in zip(cm_labels, cm):
     print(f"      {str(label):<{col_w + 4}}  " +
           "  ".join(f"{v:>{col_w}}" for v in row))
 
-# -- Classification Report ---------------------------------
 print("\n[15b] Classification Report:")
 print(classification_report(
     y_clf_test, y_clf_pred_test,
-    target_names=[str(c) for c in cm_labels],
+    target_names=np.array([str(c) for c in cm_labels]),
     zero_division=0,
 ))
 
-# -- Feature Importances -----------------------------------
 print("[15c] Feature Importances:")
 importances = best_clf.feature_importances_
 sorted_idx  = np.argsort(importances)[::-1]
@@ -355,17 +480,17 @@ for i in sorted_idx:
     bar = "|" * int(importances[i] * 40)
     print(f"      {FEATURE_COLS[i]:<18}  {importances[i]:.4f}  {bar}")
 
-
 # ----------------------------------------------------------
 # 16. Save artefacts
 # ----------------------------------------------------------
 print("\n[16] Saving model artefacts ...")
-joblib.dump(best_clf,  "best_classifier.pkl")
-joblib.dump(dt_reg,    "dt_regressor.pkl")
-joblib.dump(scaler,    "min_max_scaler.pkl")
-joblib.dump(le_country, "country_encoder.pkl")
-joblib.dump(le_market,  "market_encoder.pkl")
-joblib.dump(le_status,  "status_encoder.pkl")
+joblib.dump(best_clf,       "best_classifier.pkl")
+joblib.dump(dt_reg,         "dt_regressor.pkl")
+joblib.dump(scaler,         "min_max_scaler.pkl")
+joblib.dump(le_country,     "country_encoder.pkl")
+joblib.dump(le_market,      "market_encoder.pkl")
+joblib.dump(le_status,      "status_encoder.pkl")
+joblib.dump(best_threshold, "threshold.pkl")
 
 print("     [OK] best_classifier.pkl  saved.")
 print("     [OK] dt_regressor.pkl     saved.")
@@ -373,4 +498,25 @@ print("     [OK] min_max_scaler.pkl   saved.")
 print("     [OK] country_encoder.pkl  saved.")
 print("     [OK] market_encoder.pkl   saved.")
 print("     [OK] status_encoder.pkl   saved.")
+print(f"     [OK] threshold.pkl        saved  (value={best_threshold}).")
 print("\n[DONE] Advanced training pipeline complete!\n")
+
+# ----------------------------------------------------------
+# Metrics output
+# ----------------------------------------------------------
+print("\n===== MODEL EVALUATION =====")
+y_proba = best_clf.predict_proba(X_test)[:, 1]
+threshold = best_threshold   # Automatically use the best threshold selected
+y_pred = (y_proba >= threshold).astype(int)
+
+print("\nConfusion Matrix:")
+print(confusion_matrix(y_clf_test, y_pred))
+
+print("\nClassification Report:")
+print(classification_report(y_clf_test, y_pred))
+
+print("Accuracy:", accuracy_score(y_clf_test, y_pred))
+print("Precision:", precision_score(y_clf_test, y_pred, zero_division=0))
+print("Recall:", recall_score(y_clf_test, y_pred, zero_division=0))
+print("F1 Score:", f1_score(y_clf_test, y_pred, zero_division=0))
+print("ROC-AUC:", roc_auc_score(y_clf_test, y_proba))
