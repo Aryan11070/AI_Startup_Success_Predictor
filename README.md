@@ -51,9 +51,8 @@ Risk Score
 Funding Estimate
 Market Analysis
 
-📸 Demo
-![alt text](image.png)
 
 👨‍💻 Author
 
 Aryan
+
